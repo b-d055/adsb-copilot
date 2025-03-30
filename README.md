@@ -3,7 +3,7 @@
 A terminal-based real-time flight tracker using ADS-B data from the OpenSky Network API.
 
 ![Flight Tracker Screenshot](adsb_copilot_recording.gif)
-_Realtime ADS-B monitoring near JFK, showing aircraft lined up to takeoff, demonstrating zooming in/out, and LLM integration._
+_Realtime ADS-B monitoring near JFK, showing aircraft lined up to takeoff/landing, demonstrating zooming in/out, and LLM integration._
 
 ## Features
 
