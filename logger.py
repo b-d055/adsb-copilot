@@ -28,8 +28,10 @@ class Logger:
         if not log_file:
             # Create a log file in the same directory as the script
             script_dir = os.path.dirname(os.path.abspath(__file__))
+            log_dir = os.path.join(script_dir, 'logs')
+            os.makedirs(log_dir, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            log_file = os.path.join(script_dir, f"adsb_tracker_{timestamp}.log")
+            log_file = os.path.join(log_dir, f"adsb_tracker_{timestamp}.log")
         
         self.log_file = log_file
         

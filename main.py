@@ -50,10 +50,23 @@ class FlightTracker:
         self.lock = threading.Lock()
         self.airport_info = None
         
+        # LLM integration
+        self.use_llm = args.use_llm  # Flag to enable/disable LLM
+        self.ollama_url = args.ollama_url  # URL for Ollama server
+        self.ollama_model = args.ollama_model  # Model to use
+        self.aircraft_summary = None  # Store the summary from LLM
+        self.summary_callsign = None  # Track which aircraft summary is for
+        self.summary_thread = None  # Thread for fetching summaries
+        self.summary_lock = threading.Lock()  # Lock for accessing summary data
+        self.is_fetching_summary = False  # Flag to track summary fetching status
+        
         # Initialize logger
         self.logger = get_logger(args.log_file, args.enable_logging)
         self.logger.info(f"Flight Tracker started with bounds: lat({self.min_lat},{self.max_lat}), lon({self.min_lon},{self.max_lon})")
         self.logger.info(f"Refresh rate: {self.refresh_rate}s, API Auth: {'Yes' if self.username else 'No'}")
+        
+        if self.use_llm:
+            self.logger.info(f"LLM integration enabled: {self.ollama_url}, model: {self.ollama_model}")
         
         # Dictionary to track the latest position timestamp for each aircraft
         # Format: {icao24: {'time_position': timestamp, 'last_seen': timestamp}}
@@ -319,10 +332,26 @@ class FlightTracker:
         # Get screen dimensions
         max_y, max_x = self.stdscr.getmaxyx()
         
-        # Reserve bottom rows for info panel and legend
+        # Calculate layout with space for all sections
         info_panel_height = 10
-        legend_height = 6  # Increased height for the legend to avoid overlap
-        self.map_height = max(5, max_y - info_panel_height - legend_height)  # Ensure minimum map height
+        legend_height = 6
+        llm_summary_height = 6 if self.use_llm else 0  # Allocate space for LLM summary if enabled
+        status_bar_height = 2  # Height of the status bar at the bottom
+        
+        # Extra padding between sections to prevent overlap
+        section_padding = 1
+        
+        # Calculate total space needed for bottom sections
+        bottom_sections_height = (
+            info_panel_height + 
+            llm_summary_height + 
+            legend_height + 
+            (section_padding * 2) +  # Add padding between sections
+            status_bar_height        # Reserve space for status bar
+        )
+        
+        # Adjust map height to make room for all sections
+        self.map_height = max(5, max_y - bottom_sections_height)
         self.map_width = max_x
         
         # Draw border around map (safely)
@@ -420,13 +449,22 @@ class FlightTracker:
                                 pass
         
         # Draw information panel
-        self.draw_info_panel(self.map_height, max_x)
+        info_panel_start_y = self.map_height
+        self.draw_info_panel(info_panel_start_y, max_x)
         
-        # Draw the legend - adjusting the position to be 3 lines lower
-        legend_start_y = self.map_height + info_panel_height - legend_height + 3  # Added +3 to move down
+        # Draw LLM summary if enabled
+        llm_summary_start_y = info_panel_start_y + info_panel_height + section_padding
+        if self.use_llm:
+            self.draw_llm_summary(llm_summary_start_y, max_x)
+        
+        # Draw the legend - position after info panel and LLM summary
+        legend_start_y = llm_summary_start_y + (llm_summary_height if self.use_llm else 0) + section_padding
         self.draw_legend(legend_start_y, max_x)
         
         # Draw status bar (split into two lines)
+        # Make sure to position the status bar at the bottom of the screen
+        status_bar_y = max_y - status_bar_height
+        
         current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         
         # First line of status bar with fixed information
@@ -439,7 +477,7 @@ class FlightTracker:
                 status_line1 += "Updating data... | "
             elif self.data:
                 status_line1 += f"Last API update: {datetime.fromtimestamp(self.last_update_time).strftime('%H:%M:%S')} | "
-            
+        
         status_line1 += f"Refresh: {self.refresh_rate}s"
         
         # Second line with dynamic content (counts and status message)
@@ -447,17 +485,244 @@ class FlightTracker:
         with self.lock:
             if self.data:
                 status_line2 += f"Flights: {len(self.data.get('states', []))} | "
-            
+        
         status_line2 += f"Arrow keys:select, r:refresh, p:pause/resume, +/-:zoom, q:quit | {self.status_message}"
         
-        # Safely add the status lines
-        if max_y > 1:
-            self.safe_addstr(max_y-2, 0, status_line1)
-            self.safe_addstr(max_y-1, 0, status_line2)
+        # Safely add the status lines at the fixed position
+        self.safe_addstr(status_bar_y, 0, status_line1)
+        self.safe_addstr(status_bar_y + 1, 0, status_line2)
         
         # Refresh the screen
         self.stdscr.refresh()
     
+    def get_aircraft_summary(self, selected_state=None):
+        """Get a summary of the current airspace from the LLM"""
+        # Don't attempt if LLM is not enabled
+        if not self.use_llm:
+            return None
+            
+        # Set flag to indicate we're fetching a summary
+        self.is_fetching_summary = True
+        
+        try:
+            # Get all aircraft data
+            with self.lock:
+                display_data = self.data if self.data else self.previous_valid_data
+                if not display_data or 'states' not in display_data or not display_data['states']:
+                    return "No aircraft data available for analysis."
+                
+                # Get all aircraft states
+                states = display_data['states']
+                if not states:
+                    return "No aircraft currently in the monitored airspace."
+                
+                # Get the selected aircraft callsign
+                selected_callsign = None
+                if selected_state and selected_state[1]:
+                    selected_callsign = selected_state[1].strip()
+            
+            # Format aircraft data for the LLM prompt
+            aircraft_list = []
+            for i, state in enumerate(states[:min(25, len(states))]):  # Limit to 25 aircraft to keep prompt size reasonable
+                icao24 = state[0] or "N/A"
+                callsign = state[1].strip() if state[1] else "N/A"
+                country = state[2] or "N/A"
+                
+                lat = state[6]
+                lon = state[5]
+                position = f"{lat:.4f}, {lon:.4f}" if lat is not None and lon is not None else "N/A"
+                
+                baro_alt = state[7]
+                altitude = f"{int(baro_alt)}m" if baro_alt is not None else "N/A"
+                
+                velocity = state[9]
+                speed = f"{int(velocity)}m/s" if velocity is not None else "N/A"
+                
+                true_track = state[10]
+                heading = f"{int(true_track)}°" if true_track is not None else "N/A"
+                
+                vert_rate = state[11]
+                v_rate = f"{int(vert_rate)}m/s" if vert_rate is not None else "N/A"
+                
+                on_ground = state[8]
+                on_ground_str = "Yes" if on_ground else "No" if on_ground is not None else "Unknown"
+                
+                # Append a formatted string for each aircraft
+                aircraft_list.append(
+                    f"Aircraft {i+1}:\n"
+                    f"  ICAO: {icao24}, Callsign: {callsign}, Country: {country}\n"
+                    f"  Position: {position}, Altitude: {altitude}, Speed: {speed}\n"
+                    f"  Heading: {heading}, Vertical Rate: {v_rate}, On Ground: {on_ground_str}"
+                )
+            
+            total_aircraft = len(states)
+            if total_aircraft > 25:
+                aircraft_list.append(f"... and {total_aircraft - 25} more aircraft")
+                
+            # Build the complete prompt
+            aircraft_data = "\n".join(aircraft_list)
+            airspace_bounds = f"lat({self.min_lat:.4f},{self.max_lat:.4f}), lon({self.min_lon:.4f},{self.max_lon:.4f})"
+            
+            # If we're tracking around an airport, include that information
+            airport_info = ""
+            if self.airport_info:
+                # Use the correct key - the airport code could be stored as 'icao' or 'iata'
+                airport_code = self.airport_info.get('icao', self.airport_info.get('iata', ''))
+                airport_info = f"\nAirspace is around {self.airport_info['name']} ({airport_code}) airport."
+                
+            prompt = f"""Please provide a concise summary (5-6 lines) of the current airspace within bounds {airspace_bounds}{airport_info}
+            
+            There are {total_aircraft} aircraft currently being tracked.
+            
+            {aircraft_data}
+            
+            In your summary:
+            1. Highlight any potentially critical aircraft (unusual altitude, speed, or vertical rate)
+            2. Categorize general traffic patterns (ascending, descending, cruising)
+            3. Note any clusters or congested areas
+            4. Mention aircraft that appear to be landing or taking off
+            
+            Keep your response very concise, plain text only, and under 400 characters.
+            """
+            
+            self.logger.debug(f"Sending airspace summary LLM request")
+            
+            # Prepare the API request
+            url = f"{self.ollama_url}/api/generate"
+            payload = {
+                "model": self.ollama_model,
+                "prompt": prompt,
+                "stream": False
+            }
+            
+            # Make the API request
+            response = requests.post(url, json=payload, timeout=15)  # Increased timeout for larger prompt
+            response.raise_for_status()
+            
+            # Parse the response
+            self.logger.debug(f"Received LLM response for airspace summary")
+            
+            try:
+                result = response.json()
+                
+                # Extract the generated text
+                if "response" in result:
+                    summary = result["response"].strip()
+                    
+                    # Save the summary, using "AIRSPACE" as a special callsign
+                    with self.summary_lock:
+                        self.aircraft_summary = summary
+                        self.summary_callsign = "AIRSPACE"
+                    
+                    self.logger.debug(f"Processed airspace summary: {len(summary)} chars")
+                    return summary
+                else:
+                    error_msg = "LLM response missing 'response' field"
+                    self.logger.warning(f"{error_msg}: {result}")
+                    return f"{error_msg}. Please try again."
+            except json.JSONDecodeError:
+                error_msg = "Failed to parse LLM response JSON"
+                self.logger.error(f"{error_msg}: {response.text[:100]}...")
+                return f"{error_msg}. Please try again."
+                    
+        except requests.exceptions.RequestException as e:
+            error_msg = f"Error making LLM request: {str(e)}"
+            self.logger.error(error_msg)
+            return error_msg
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            self.logger.error(f"Unexpected error getting airspace summary: {str(e)}\n{error_details}")
+            return f"Error analyzing airspace: {str(e)}"
+        finally:
+            self.is_fetching_summary = False
+
+    def fetch_summary_async(self, state=None):
+        """Start a thread to fetch the airspace summary asynchronously"""
+        if not self.use_llm or self.is_fetching_summary:
+            return
+            
+        # Start a new thread to fetch the summary
+        self.summary_thread = threading.Thread(
+            target=self.get_aircraft_summary,
+            args=(state,)
+        )
+        self.summary_thread.daemon = True
+        self.summary_thread.start()
+
+    def draw_llm_summary(self, start_y, max_x):
+        """Draw the LLM summary in its own dedicated area"""
+        if not self.use_llm:
+            return
+            
+        # Get screen dimensions
+        max_y, _ = self.stdscr.getmaxyx()
+        
+        # Draw section header with border
+        section_title = "LLM Airspace Summary"
+        separator = "=" * (max_x-1)
+        
+        # Draw section header and separator
+        self.safe_addstr(start_y, 0, section_title, curses.A_BOLD)
+        self.safe_addstr(start_y+1, 0, separator)
+        
+        # Get the summary content or status
+        with self.lock:
+            display_data = self.data if self.data else self.previous_valid_data
+            if not display_data or 'states' not in display_data or not display_data['states']:
+                self.safe_addstr(start_y+2, 2, "No aircraft data available for summary")
+                return
+                
+            # Get selected aircraft for context (not used for summary generation anymore)
+            states = display_data['states']
+            if not states:
+                self.safe_addstr(start_y+2, 2, "No aircraft in current airspace")
+                return
+                
+            selected = None
+            if 0 <= self.selected_idx < len(states):
+                selected = states[self.selected_idx]
+        
+        # Display the summary or status message
+        with self.summary_lock:
+            summary_message = None
+            
+            if self.is_fetching_summary:
+                summary_message = "Generating airspace summary..."
+            elif self.aircraft_summary:
+                summary_message = self.aircraft_summary
+            else:
+                summary_message = "No airspace summary available. Press 'r' to refresh."
+        
+        if summary_message:
+            # Split the summary into multiple lines if needed
+            max_line_width = max_x - 4  # Leave some margin
+            summary_lines = []
+            
+            # Simple word wrapping
+            words = summary_message.split()
+            current_line = ""
+            
+            for word in words:
+                if len(current_line) + len(word) + 1 <= max_line_width:
+                    current_line += (" " + word) if current_line else word
+                else:
+                    summary_lines.append(current_line)
+                    current_line = word
+            
+            if current_line:
+                summary_lines.append(current_line)
+            
+            # Display each line of the summary, up to available space
+            max_lines = 4  # Limit to 4 lines of summary text
+            for i, line in enumerate(summary_lines[:max_lines]):
+                if start_y + 2 + i < max_y:
+                    self.safe_addstr(start_y + 2 + i, 2, line)
+            
+            # If we had to truncate the summary, show an indicator
+            if len(summary_lines) > max_lines and start_y + 2 + max_lines < max_y:
+                self.safe_addstr(start_y + 2 + max_lines, 2, "...")
+
     def draw_info_panel(self, start_y, max_x):
         """Draw the information panel for the selected aircraft"""
         with self.lock:
@@ -476,6 +741,24 @@ class FlightTracker:
             
             # Get the color for the selected aircraft
             color_attr = self.get_aircraft_color(selected)
+            
+            # Start fetching airspace summary if LLM is enabled (passing selected for context)
+            if self.use_llm:
+                # Only request a new summary if we don't have one already or if it's been a while
+                current_time = time.time()
+                
+                # Initialize last_summary_time if it doesn't exist
+                if not hasattr(self, 'last_summary_time'):
+                    self.last_summary_time = 0
+                    
+                summary_age = current_time - self.last_summary_time
+                
+                # Request a new summary if we don't have one or if it's older than refresh rate
+                if not self.aircraft_summary or summary_age > self.refresh_rate * 2:
+                    if not self.is_fetching_summary:
+                        self.fetch_summary_async(selected)
+                        # Update the last summary time
+                        self.last_summary_time = current_time
         
         # Get screen dimensions
         max_y, max_width = self.stdscr.getmaxyx()
@@ -626,6 +909,8 @@ class FlightTracker:
         
         # Main loop
         self.running = True
+        # Add summary age tracking 
+        self.last_summary_time = 0
         try:
             while self.running:
                 try:
@@ -741,8 +1026,13 @@ class FlightTracker:
             (curses.color_pair(6), "White", "Unknown/Default")
         ]
         
-        # Draw legend title, ensure it starts on a new line to avoid overlap
-        self.safe_addstr(start_y, 2, "Legend:", curses.A_BOLD)
+        # Draw section header
+        section_title = "Legend"
+        separator = "-" * (max_x-1)
+        
+        # Draw section header and separator
+        self.safe_addstr(start_y, 0, section_title, curses.A_BOLD)
+        self.safe_addstr(start_y+1, 0, separator)
         
         # Determine layout (2 columns if enough space)
         cols = 2 if max_x >= 80 else 1
@@ -752,14 +1042,20 @@ class FlightTracker:
         for i, (color, name, desc) in enumerate(legend_items):
             row = i % (len(legend_items) // cols + (1 if len(legend_items) % cols else 0))
             col = i // (len(legend_items) // cols + (1 if len(legend_items) % cols else 0))
+            
+            # Add 2 to start_y to account for the title and separator
             y_pos = start_y + 2 + row
             x_pos = 2 + col * col_width
             
             # Draw colored symbol
             if x_pos < max_x - 2:
-                self.stdscr.addch(y_pos, x_pos, '•', color)
-                # Draw description
-                self.safe_addstr(y_pos, x_pos + 2, f"{name}: {desc}", color)
+                try:
+                    self.stdscr.addch(y_pos, x_pos, '•', color)
+                    # Draw description
+                    self.safe_addstr(y_pos, x_pos + 2, f"{name}: {desc}", color)
+                except curses.error:
+                    # Catch any errors from drawing outside the screen
+                    pass
 
 def main(stdscr, args):
     tracker = None
@@ -805,6 +1101,11 @@ if __name__ == "__main__":
     parser.add_argument('--log-file', type=str, help='Path to log file (default: auto-generated in script directory)')
     parser.add_argument('--enable-logging', action='store_true', default=True, help='Enable logging (default: True)')
     parser.add_argument('--disable-logging', action='store_false', dest='enable_logging', help='Disable logging')
+    
+    # LLM options
+    parser.add_argument('--use-llm', action='store_true', help='Enable LLM integration for aircraft summaries')
+    parser.add_argument('--ollama-url', type=str, default='http://localhost:11434', help='URL for Ollama API (default: http://localhost:11434)')
+    parser.add_argument('--ollama-model', type=str, default='gemma3:1b', help='Model to use for Ollama (default: gemma3:1b)')
     
     args = parser.parse_args()
     
