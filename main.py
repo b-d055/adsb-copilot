@@ -54,6 +54,7 @@ class FlightTracker:
         self.use_llm = args.use_llm  # Flag to enable/disable LLM
         self.ollama_url = args.ollama_url  # URL for Ollama server
         self.ollama_model = args.ollama_model  # Model to use
+        self.llm_refresh_rate = args.llm_refresh  # LLM refresh rate in seconds
         self.aircraft_summary = None  # Store the summary from LLM
         self.summary_callsign = None  # Track which aircraft summary is for
         self.summary_thread = None  # Thread for fetching summaries
@@ -66,7 +67,7 @@ class FlightTracker:
         self.logger.info(f"Refresh rate: {self.refresh_rate}s, API Auth: {'Yes' if self.username else 'No'}")
         
         if self.use_llm:
-            self.logger.info(f"LLM integration enabled: {self.ollama_url}, model: {self.ollama_model}")
+            self.logger.info(f"LLM integration enabled: {self.ollama_url}, model: {self.ollama_model}, refresh: {self.llm_refresh_rate}s")
         
         # Dictionary to track the latest position timestamp for each aircraft
         # Format: {icao24: {'time_position': timestamp, 'last_seen': timestamp}}
@@ -105,6 +106,7 @@ class FlightTracker:
         if self.username and self.password:
             auth = (self.username, self.password)
         
+        self.logger.info(f"Auth {auth}")
         # Log the request
         self.logger.debug(f"Fetching data from API: {url}")
         
@@ -497,8 +499,8 @@ class FlightTracker:
     
     def get_aircraft_summary(self, selected_state=None):
         """Get a summary of the current airspace from the LLM"""
-        # Don't attempt if LLM is not enabled
-        if not self.use_llm:
+        # Don't attempt if LLM is not enabled or if data updates are paused
+        if not self.use_llm or self.paused:
             return None
             
         # Set flag to indicate we're fetching a summary
@@ -549,8 +551,8 @@ class FlightTracker:
                 
                 # Append a formatted string for each aircraft
                 aircraft_list.append(
-                    f"Aircraft {i+1}:\n"
-                    f"  ICAO: {icao24}, Callsign: {callsign}, Country: {country}\n"
+                    f"Callsign {callsign}:\n"
+                    f"  ICAO: {icao24}, Aircraft {i+1}, Country: {country}\n"
                     f"  Position: {position}, Altitude: {altitude}, Speed: {speed}\n"
                     f"  Heading: {heading}, Vertical Rate: {v_rate}, On Ground: {on_ground_str}"
                 )
@@ -572,18 +574,18 @@ class FlightTracker:
                 
             prompt = f"""Please provide a concise summary (5-6 lines) of the current airspace within bounds {airspace_bounds}{airport_info}
             
-            There are {total_aircraft} aircraft currently being tracked.
-            
-            {aircraft_data}
-            
-            In your summary:
-            1. Highlight any potentially critical aircraft (unusual altitude, speed, or vertical rate)
-            2. Categorize general traffic patterns (ascending, descending, cruising)
-            3. Note any clusters or congested areas
-            4. Mention aircraft that appear to be landing or taking off
-            
-            Keep your response very concise, plain text only, and under 400 characters.
-            """
+There are {total_aircraft} aircraft currently being tracked.
+
+{aircraft_data}
+
+In your summary:
+1. Highlight any potentially critical aircraft (unusual altitude, speed, or vertical rate)
+2. Categorize general traffic patterns (ascending, descending, cruising)
+3. Note any clusters or congested areas
+4. Mention aircraft that appear to be landing or taking off
+
+Keep your response very concise, plain text only, and under 500 characters.
+"""
             
             self.logger.debug(f"Sending airspace summary LLM request")
             
@@ -602,6 +604,9 @@ class FlightTracker:
             # Parse the response
             self.logger.debug(f"Received LLM response for airspace summary")
             
+            # Log the prompt to the summaries file, not to the main log
+            self.logger.log_aircraft_summary("PROMPT", prompt)
+            
             try:
                 result = response.json()
                 
@@ -614,6 +619,10 @@ class FlightTracker:
                         self.aircraft_summary = summary
                         self.summary_callsign = "AIRSPACE"
                     
+                    # Log the summary to dedicated file instead of main log
+                    self.logger.log_aircraft_summary("AIRSPACE", summary)
+                    
+                    # Only log minimal info to main log
                     self.logger.debug(f"Processed airspace summary: {len(summary)} chars")
                     return summary
                 else:
@@ -753,8 +762,8 @@ class FlightTracker:
                     
                 summary_age = current_time - self.last_summary_time
                 
-                # Request a new summary if we don't have one or if it's older than refresh rate
-                if not self.aircraft_summary or summary_age > self.refresh_rate * 2:
+                # Request a new summary if we don't have one or if it's older than llm_refresh_rate
+                if not self.aircraft_summary or summary_age > self.llm_refresh_rate:
                     if not self.is_fetching_summary:
                         self.fetch_summary_async(selected)
                         # Update the last summary time
@@ -1106,6 +1115,7 @@ if __name__ == "__main__":
     parser.add_argument('--use-llm', action='store_true', help='Enable LLM integration for aircraft summaries')
     parser.add_argument('--ollama-url', type=str, default='http://localhost:11434', help='URL for Ollama API (default: http://localhost:11434)')
     parser.add_argument('--ollama-model', type=str, default='gemma3:1b', help='Model to use for Ollama (default: gemma3:1b)')
+    parser.add_argument('--llm-refresh', type=float, default=20.0, help='How often to refresh LLM summaries in seconds (default: 20.0)')
     
     args = parser.parse_args()
     

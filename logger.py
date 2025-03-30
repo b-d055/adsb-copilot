@@ -24,6 +24,7 @@ class Logger:
         self.enabled = enabled
         self.lock = threading.Lock()
         self.file_handle: Optional[TextIO] = None
+        self.aircraft_summary_handle: Optional[TextIO] = None
         
         if not log_file:
             # Create a log file in the same directory as the script
@@ -35,14 +36,24 @@ class Logger:
         
         self.log_file = log_file
         
+        # Create a separate file for aircraft summaries
+        if self.enabled:
+            summary_file = os.path.splitext(log_file)[0] + "_summaries.md"
+            self.summary_file = summary_file
+        
         if self.enabled:
             try:
                 self.file_handle = open(self.log_file, 'a', encoding='utf-8')
                 self.info(f"Log started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
                 self.info(f"Log file: {self.log_file}")
+                
+                # Open the aircraft summaries file
+                self.aircraft_summary_handle = open(self.summary_file, 'a', encoding='utf-8')
+                self.aircraft_summary_handle.write(f"# Aircraft Summaries - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                self.info(f"Aircraft summaries file: {self.summary_file}")
             except Exception as e:
                 self.enabled = False
-                print(f"Error opening log file: {str(e)}", file=sys.stderr)
+                print(f"Error opening log files: {str(e)}", file=sys.stderr)
     
     def __del__(self):
         """Close the log file when the logger is destroyed"""
@@ -53,24 +64,31 @@ class Logger:
             pass
     
     def close(self):
-        """Close the log file"""
-        if self.file_handle:
+        """Close the log files"""
+        if self.file_handle or self.aircraft_summary_handle:
             try:
                 # Use a timeout when acquiring the lock to prevent deadlocks during shutdown
                 if self.lock.acquire(timeout=1.0):
                     try:
                         self.info(f"Log closed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                        self.file_handle.close()
+                        if self.file_handle:
+                            self.file_handle.close()
+                        if self.aircraft_summary_handle:
+                            self.aircraft_summary_handle.close()
                     finally:
                         self.lock.release()
                 else:
-                    # If we couldn't acquire the lock, still try to close the file
-                    self.file_handle.close()
+                    # If we couldn't acquire the lock, still try to close the files
+                    if self.file_handle:
+                        self.file_handle.close()
+                    if self.aircraft_summary_handle:
+                        self.aircraft_summary_handle.close()
             except Exception:
                 # Suppress errors during close as we're shutting down anyway
                 pass
             finally:
                 self.file_handle = None
+                self.aircraft_summary_handle = None
     
     def _write(self, level: str, message: str):
         """
@@ -120,6 +138,37 @@ class Logger:
     def debug(self, message: str):
         """Log a debug message"""
         self._write("DEBUG", message)
+        
+    def log_aircraft_summary(self, callsign: str, summary: str):
+        """Log an aircraft summary to the dedicated file
+        
+        Args:
+            callsign (str): The callsign of the aircraft or 'AIRSPACE' for general summary
+            summary (str): The summary text from the LLM
+        """
+        if not self.enabled or not self.aircraft_summary_handle:
+            return
+            
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Use a timeout when acquiring the lock to prevent deadlocks
+        acquired = False
+        try:
+            acquired = self.lock.acquire(timeout=0.5)
+            if acquired and self.aircraft_summary_handle:
+                try:
+                    self.aircraft_summary_handle.write(f"## {callsign} - {timestamp}\n\n{summary}\n\n---\n\n")
+                    self.aircraft_summary_handle.flush()  # Ensure it's written immediately
+                except Exception:
+                    # If we can't write to the summary file, just continue
+                    pass
+        except Exception:
+            # If anything goes wrong with lock acquisition, just continue
+            pass
+        finally:
+            # Only release if we actually acquired the lock
+            if acquired:
+                self.lock.release()
     
     def log_request(self, url: str, status_code: Optional[int] = None, 
                     duration: Optional[float] = None, error: Optional[str] = None):
